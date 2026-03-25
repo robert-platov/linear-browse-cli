@@ -1,4 +1,4 @@
-# linear-browse
+# linear-browse-cli
 
 Interactive [Linear](https://linear.app) issue browser for the terminal. Built on [fzf](https://github.com/junegunn/fzf) and [linear-cli](https://github.com/schpet/linear-cli).
 
