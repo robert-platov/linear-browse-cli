@@ -1,0 +1,254 @@
+#!/bin/sh
+set -eu
+
+# ============================================================
+# linear-browse — interactive Linear issue browser
+# https://github.com/nichochar/linear-browse
+#
+# Requires: linear-cli, fzf (>=0.54), jq, perl
+# Optional: glow (rendered markdown in preview)
+# ============================================================
+
+VERSION="1.0.0"
+
+# --- Paths & Constants ---
+SELF="$(cd "$(dirname "$0")" && pwd)/$(basename "$0")"
+_TMPDIR="${TMPDIR:-/tmp}"
+_TF_TEAM="$_TMPDIR/linear-browse-team"
+_TF_PROJECT="$_TMPDIR/linear-browse-project"
+
+# --- Utility Functions ---
+
+die() { printf 'linear-browse: %s\n' "$*" >&2; exit 1; }
+
+has_cmd() { command -v "$1" >/dev/null 2>&1; }
+
+# Parse a flat TOML key=value (no sections/tables)
+read_toml_key() {
+    file="$1" key="$2"
+    awk -F'=' -v k="$key" '{
+        gsub(/^[ \t]+|[ \t]+$/, "", $1)
+        if ($1 == k) {
+            val = $2
+            gsub(/^[ \t"]+|[ \t"]+$/, "", val)
+            print val
+        }
+    }' "$file" 2>/dev/null
+}
+
+# Resolve the path to .linear.toml (cwd first, then $HOME)
+find_toml() {
+    if [ -f ".linear.toml" ]; then
+        echo ".linear.toml"
+    elif [ -f "$HOME/.linear.toml" ]; then
+        echo "$HOME/.linear.toml"
+    fi
+}
+
+# --- Subcommand Functions ---
+
+do_fmt() {
+    perl -pe '
+        s/^(\s*)- \*\*(@[^*]+)\*\* - \*([^*]+)\*\s*$/\n---\n$2 · $3\n/;
+        s/^  //;
+    '
+}
+
+do_preview() {
+    issue_id="$1"
+    cols="${2:-80}"
+    if has_cmd glow; then
+        linear issue view "$issue_id" --no-pager 2>/dev/null \
+            | do_fmt \
+            | CLICOLOR_FORCE=1 glow -s dark -w "$cols"
+    else
+        linear issue view "$issue_id" --no-pager 2>/dev/null \
+            | do_fmt
+    fi
+}
+
+do_detail() {
+    issue_id="$1"
+    if has_cmd glow; then
+        linear issue view "$issue_id" --no-pager 2>/dev/null \
+            | do_fmt \
+            | CLICOLOR_FORCE=1 glow -s dark \
+            | less -R --mouse
+    else
+        linear issue view "$issue_id" --no-pager 2>/dev/null \
+            | do_fmt \
+            | less -R --mouse
+    fi
+}
+
+do_projects() {
+    linear api '{ projects(first:100) { nodes { name } } }' 2>/dev/null \
+        | jq -r '.data.projects.nodes[].name'
+}
+
+do_teams() {
+    linear api '{ teams { nodes { key name } } }' 2>/dev/null \
+        | jq -r '.data.teams.nodes[] | "\(.key)\t\(.name)"'
+}
+
+do_pick_project() {
+    result=$(do_projects | fzf --prompt "Project › " --reverse) || true
+    [ -n "$result" ] && printf '%s' "$result" > "$_TF_PROJECT"
+}
+
+do_pick_team() {
+    result=$(do_teams | fzf --prompt "Team › " --reverse --with-nth=2 --delimiter='\t') || true
+    if [ -n "$result" ]; then
+        team_key=$(printf '%s' "$result" | cut -f1)
+        printf '%s' "$team_key" > "$_TF_TEAM"
+        # Clear project filter when switching teams
+        rm -f "$_TF_PROJECT"
+    fi
+}
+
+do_list() {
+    team="$1"; shift
+    project="${1:-}"; shift || true
+    state="${1:-active}"; shift || true
+
+    project_flag=""
+    [ -n "$project" ] && project_flag="--project '$project'"
+
+    state_flags=""
+    case "$state" in
+        all)       state_flags="--all-states" ;;
+        active)    state_flags="--state started --state unstarted" ;;
+        started)   state_flags="--state started" ;;
+        unstarted) state_flags="--state unstarted" ;;
+        *)         state_flags="--state $state" ;;
+    esac
+
+    eval "linear issue list --team '$team' --all-assignees $project_flag $state_flags --sort priority --no-pager" 2>/dev/null
+}
+
+usage() {
+    cat <<'EOF'
+linear-browse — interactive Linear issue browser
+
+Usage:
+  linear-browse              Launch the browser
+  linear-browse --help       Show this help
+  linear-browse --version    Print version
+
+Keybindings:
+  enter       Open issue in browser
+  ctrl-v      View issue details (full screen)
+  ctrl-p      Filter by project
+  ctrl-t      Switch team
+  ctrl-s      Show started issues
+  ctrl-u      Show unstarted issues
+  ctrl-a      Show all issues
+  ctrl-r      Reset all filters
+
+Configuration:
+  Reads default team from .linear.toml (cwd or $HOME).
+  Run `linear config` to generate one.
+
+Requires: linear-cli, fzf (>=0.54), jq, perl
+Optional: glow (for rendered markdown preview)
+EOF
+}
+
+# --- Dispatch (subcommand invocation exits here) ---
+case "${1:-}" in
+    --fmt)          do_fmt; exit ;;
+    --preview)      shift; do_preview "$@"; exit ;;
+    --detail)       shift; do_detail "$@"; exit ;;
+    --projects)     do_projects; exit ;;
+    --teams)        do_teams; exit ;;
+    --pick-project) do_pick_project; exit ;;
+    --pick-team)    do_pick_team; exit ;;
+    --list)         shift; do_list "$@"; exit ;;
+    --version)      echo "linear-browse $VERSION"; exit ;;
+    -h|--help)      usage; exit 0 ;;
+    -*)             die "unknown option: $1" ;;
+esac
+
+
+# === MAIN ENTRYPOINT ===
+
+# 1. Dependency checks
+missing=""
+for cmd in fzf linear jq perl; do
+    has_cmd "$cmd" || missing="$missing $cmd"
+done
+[ -z "$missing" ] && true || die "missing dependencies:$missing"
+
+# 2. Check fzf version (need >=0.54 for --with-shell)
+fzf_minor=$(fzf --version 2>/dev/null | awk '{print $1}' | cut -d. -f2)
+if [ "${fzf_minor:-0}" -lt 54 ]; then
+    die "fzf >= 0.54 required (found $(fzf --version 2>/dev/null | awk '{print $1}'))"
+fi
+
+# 3. Check linear auth & network
+if ! linear api '{ viewer { id } }' 2>/dev/null | jq -e '.data.viewer.id' >/dev/null 2>&1; then
+    echo "Not authenticated or network unavailable. Starting login..."
+    linear auth login
+    # Retry
+    if ! linear api '{ viewer { id } }' 2>/dev/null | jq -e '.data.viewer.id' >/dev/null 2>&1; then
+        die "authentication failed — check network and try 'linear auth login'"
+    fi
+fi
+
+# 4. Resolve team
+team=""
+# Try tmpfile first
+[ -f "$_TF_TEAM" ] && team=$(tr -d '\n' < "$_TF_TEAM" 2>/dev/null)
+
+# Try .linear.toml
+if [ -z "$team" ]; then
+    toml=$(find_toml)
+    [ -n "$toml" ] && team=$(read_toml_key "$toml" "team_id")
+fi
+
+# Try API (auto-select if single team, otherwise pick)
+if [ -z "$team" ]; then
+    teams_raw=$(do_teams)
+    team_count=$(printf '%s\n' "$teams_raw" | wc -l | tr -d ' ')
+    if [ "$team_count" -eq 0 ]; then
+        die "no teams found in your Linear workspace"
+    elif [ "$team_count" -eq 1 ]; then
+        team=$(printf '%s' "$teams_raw" | cut -f1)
+    else
+        echo "Multiple teams found. Please select one:"
+        do_pick_team
+        team=$(tr -d '\n' < "$_TF_TEAM" 2>/dev/null)
+        [ -z "$team" ] && die "no team selected"
+    fi
+fi
+
+# 5. Resolve project filter
+project=$(tr -d '\n' < "$_TF_PROJECT" 2>/dev/null) || true
+prompt_base="$team"
+[ -n "$project" ] && prompt_base="$team:$project"
+
+# 6. Build fzf arguments and launch
+preview="$SELF --preview {2} \$FZF_PREVIEW_COLUMNS"
+open_web='enter:execute-silent(linear issue view {2} --web)'
+view_detail="ctrl-v:execute($SELF --detail {2})"
+
+list_cmd="$SELF --list $team '$project'"
+
+header='RET open | ^v detail | ^p project | ^t team | ^s started | ^u unstarted | ^a all | ^r reset'
+
+eval "$list_cmd active" | fzf \
+    --ansi \
+    --header-lines=1 \
+    --prompt "$prompt_base active › " \
+    --header "$header" \
+    --preview "$preview" \
+    --preview-window 'right:50%' \
+    --with-shell 'sh -c' \
+    --bind "$open_web" \
+    --bind "$view_detail" \
+    --bind "ctrl-p:execute($SELF --pick-project)+become($SELF)" \
+    --bind "ctrl-t:execute($SELF --pick-team)+become($SELF)" \
+    --bind "ctrl-s:reload($list_cmd started)+change-prompt($prompt_base started › )" \
+    --bind "ctrl-u:reload($list_cmd unstarted)+change-prompt($prompt_base unstarted › )" \
+    --bind "ctrl-a:reload($list_cmd all)+change-prompt($prompt_base all › )" \
+    --bind "ctrl-r:execute-silent(rm -f '$_TF_TEAM' '$_TF_PROJECT')+become($SELF)"
